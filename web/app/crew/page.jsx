@@ -6,8 +6,11 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { Recorder, connect, crewFetch, loadConfig, toBase64 } from "@/lib/hub";
 import { Icon } from "@/lib/icons";
 import { Picto } from "@/lib/pictograms";
-import { canSpeak, speak } from "@/lib/speech";
-import { Ambient, AppHeader, ease } from "@/components/ui";
+import { ACCESSIBILITY_META } from "@/lib/accessibility";
+import { canSpeak, speakNatural as speak, unlockAudio } from "@/lib/speech";
+import { Ambient, AppHeader, Sheet, ease } from "@/components/ui";
+import { FreeTalkPanel } from "@/components/freetalk";
+import { ConvThread, MuteButton } from "@/components/liveconversation";
 
 const STATUS = {
   urgent_unconfirmed: ["至急・未確認", "Urgent, unconfirmed", "bad"],
@@ -24,6 +27,13 @@ const HEAT = {
   offline: ["端末なし", "No device", "var(--idle)"],
 };
 const VERDICT = { sure: ["一致 Matched", "ok"], check: ["要確認 Please check", "call"], none: ["該当なし Not in library", "bad"] };
+const RIGHT_TABS = [
+  { id: "map", ja: "客室図", en: "Cabin map" },
+  { id: "safety", ja: "安全案内", en: "Safety" },
+  { id: "pa", ja: "アナウンス", en: "Announcements" },
+  { id: "chat", ja: "会話", en: "Live chat" },
+  { id: "exit", ja: "非常口", en: "Exit check" },
+];
 
 export default function Crew() {
   const [cfg, setCfg] = useState(null);
@@ -31,15 +41,24 @@ export default function Crew() {
   const [online, setOnline] = useState(false);
   const [soundOn, setSoundOn] = useState(true);
   const [readAloud, setReadAloud] = useState(false);
+  const [convMuted, setConvMuted] = useState(false);
   const [jaVoice, setJaVoice] = useState(false);
-  const [pb, setPb] = useState(null);           // {seat, lang}
+  const [pb, setPb] = useState(null);           // {seat} or null
+  const [pickedSeat, setPickedSeat] = useState(null);
+  const [rightTab, setRightTab] = useState("map");
+  const [briefing, setBriefing] = useState(null);
+  const [briefingLoading, setBriefingLoading] = useState(false);
+  const [conv, setConv] = useState({});         // seat -> { open, messages: [] }
   const [pa, setPa] = useState(null);           // match result | {busy} | {error} | {sent}
   const [paPick, setPaPick] = useState(null);
   const [paN, setPaN] = useState("");
   const [paRecOn, setPaRecOn] = useState(false);
+  const [myName, setMyName] = useState("");
+  const [myZone, setMyZone] = useState("all");
+  const myInfo = useRef({ name: "", zone: "all" });
   const socket = useRef(null), audio = useRef(null), paRec = useRef(null);
   const seenUrgent = useRef(new Set()), announced = useRef(null), announcedSymptom = useRef(new Set());
-  const opts = useRef({ soundOn: true, readAloud: false }); opts.current = { soundOn, readAloud };
+  const opts = useRef({ soundOn: true, readAloud: false, convMuted: false }); opts.current = { soundOn, readAloud, convMuted };
 
   function beep() {
     if (!opts.current.soundOn || !audio.current) return;
@@ -70,18 +89,79 @@ export default function Crew() {
     speak(newOnes.map((c) => `${c.urgent ? "至急。" : ""}${c.seat}、${c.crew_ja || (c.guesses[0] ? c.guesses[0].label_ja : "ご用件が不明です")}`), "ja");
   }
 
+  function sendHello(name, zone) {
+    myInfo.current = { name, zone };
+    socket.current?.send({ type: "hello", name, zone });
+  }
+
   useEffect(() => {
-    const unlock = () => { audio.current ??= new AudioContext(); };
+    const unlock = () => { audio.current ??= new AudioContext(); unlockAudio(); };
     addEventListener("pointerdown", unlock, { once: true });
     canSpeak("ja").then(setJaVoice);
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem("auralink-crew-id") || "{}"); } catch { /* blocked */ }
+    // crew no longer type a name — a short per-device tag is generated once and reused, so
+    // "claim"/"release" on a request still knows which tablet is on it without asking anyone to fill in a field.
+    let tag = saved.name;
+    if (!tag) {
+      const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+      tag = `Crew-${letters[Math.floor(Math.random() * letters.length)]}${Math.floor(Math.random() * 10)}`;
+    }
+    setMyName(tag);
+    if (saved.zone) setMyZone(saved.zone);
+    myInfo.current = { name: tag, zone: saved.zone || "all" };
     loadConfig().then((c) => {
       setCfg(c);
-      socket.current = connect("/ws/crew", (msg) => { if (msg.type === "state") { sideEffects(msg); setState(msg); } }, setOnline);
+      socket.current = connect("/ws/crew", (msg) => {
+        if (msg.type === "state") {
+          sideEffects(msg); setState(msg);
+          setConv((c) => {
+            const open = new Set(msg.conv_seats || []);
+            const next = { ...c };
+            for (const seat of open) next[seat] = { messages: [], ...next[seat], open: true };
+            for (const seat of Object.keys(next)) if (!open.has(seat)) next[seat] = { ...next[seat], open: false };
+            return next;
+          });
+        }
+        else if (msg.type === "conv_state") {
+          setConv((c) => ({ ...c, [msg.seat]: { open: msg.open, messages: c[msg.seat]?.messages || [] } }));
+        } else if (msg.type === "conv_message") {
+          setConv((c) => {
+            const prev = c[msg.seat] || { open: true, messages: [] };
+            const i = prev.messages.findIndex((m) => m.id === msg.id);
+            const messages = i >= 0
+              ? prev.messages.map((m, idx) => (idx === i ? msg : m))
+              : [...prev.messages, msg];
+            return { ...c, [msg.seat]: { ...prev, messages } };
+          });
+          // a live conversation is spoken, not just displayed: crew hears the passenger's
+          // message in Japanese as soon as it finishes streaming, same as the passenger hears
+          // crew's reply in their own language (app/passenger/page.jsx's onMessage)
+          if (msg.from === "passenger" && msg.done && msg.translated && !opts.current.convMuted) speak(msg.translated, "ja");
+        }
+      }, (on) => { setOnline(on); if (on && myInfo.current.name) sendHello(myInfo.current.name, myInfo.current.zone); });
     });
     return () => { socket.current?.close(); removeEventListener("pointerdown", unlock); };
   }, []); // eslint-disable-line
 
   const send = (m) => socket.current?.send(m);
+
+  function saveIdentity(zone) {
+    setMyZone(zone);
+    try { localStorage.setItem("auralink-crew-id", JSON.stringify({ name: myName, zone })); } catch { /* blocked */ }
+    sendHello(myName, zone);
+  }
+
+  async function refreshBriefing() {
+    setBriefingLoading(true);
+    try {
+      const res = await crewFetch("/api/crew/briefing");
+      setBriefing(await res.json());
+    } catch {
+      setBriefing({ summary: null });
+    }
+    setBriefingLoading(false);
+  }
 
   async function paMatch(body) {
     setPa({ busy: true });
@@ -118,20 +198,45 @@ export default function Crew() {
   const PA = Object.fromEntries((cfg.announcements || []).map((a) => [a.id, a]));
   const cards = state?.cards || [];
   const openUrgent = cards.filter((c) => c.urgent && c.status !== "acknowledged");
+  const visibleCards = myZone !== "all" ? cards.filter((c) => c.urgent || c.zone === myZone) : cards;
 
   return (
     <>
       <Ambient />
       <AppHeader online={online} title="客室乗務員パネル" sub="Crew panel">
-        <label className="row muted">飛行フェーズ Phase
+        <label className="hdr-field" title="Tells the matcher what part of the flight this is, so it can favour phase-relevant words — e.g. 'meal' makes food items more likely than during cruise.">
+          <span className="hdr-field-label">飛行フェーズ Phase</span>
           <select value={state?.phase || "cruise"} onChange={(e) => send({ type: "phase", phase: e.target.value })}>
             {cfg.phases.map((p) => <option key={p} value={p}>{p}</option>)}</select></label>
-        <button className="ghost" aria-pressed={soundOn} onClick={() => setSoundOn((x) => !x)}><Icon id="bell" /> {soundOn ? "音 Sound on" : "消音 Muted"}</button>
-        <button className="ghost" onClick={() => setPb({ seat: null, lang: "hi" })}><Icon id="chat" /> 会話帳 Phrasebook</button>
-        {jaVoice ? <label className="row muted"><input type="checkbox" checked={readAloud} onChange={(e) => setReadAloud(e.target.checked)} /> 読み上げ Read aloud</label> : null}
-      </AppHeader>
 
-      <main className="app" style={{ maxWidth: 1320 }}>
+        <div className="hdr-divider" aria-hidden="true" />
+
+        <button type="button" className={`hdr-icon-btn ${soundOn ? "on" : ""}`} aria-pressed={soundOn} onClick={() => setSoundOn((x) => !x)}
+          title="Sound: plays a chime on this tablet the moment a new urgent (possible medical) request comes in. Click to mute.">
+          <Icon id="bell" /></button>
+        {jaVoice ? (
+          <button type="button" className={`hdr-icon-btn ${readAloud ? "on" : ""}`} aria-pressed={readAloud} onClick={() => setReadAloud((x) => !x)}
+            title="Read aloud: when a passenger reports a medical symptom, speaks the seat and symptom aloud in Japanese — useful if you're not looking at the screen. Off by default.">
+            <Icon id="speaker" /></button>
+        ) : null}
+        <button className="ghost" onClick={() => setPb({ seat: null })}><Icon id="chat" /> 会話帳 Phrasebook</button>
+
+        <div className="hdr-divider" aria-hidden="true" />
+
+        <label className="hdr-field" title="Filters the request list to your cabin zone (urgent requests always still show). Pick 全体 All to see every request again.">
+          <span className="hdr-field-label">担当 Zone</span>
+          <select value={myZone} onChange={(e) => saveIdentity(e.target.value)}>
+            <option value="all">全体 All</option>
+            {(cfg.crew_zones || []).map((z) => <option key={z.id} value={z.id}>区画 {z.id} · rows {Math.min(...z.seats.map((s) => +s.slice(0, -1)))}-{Math.max(...z.seats.map((s) => +s.slice(0, -1)))}</option>)}
+          </select></label>
+      </AppHeader>
+      {(state?.crew_roster?.length) ? (
+        <p className="muted mono crew-shell" style={{ margin: "0 auto", padding: "0 20px" }}>
+          乗務員 Crew online: {state.crew_roster.map((m) => `${m.name}${m.zone !== "all" ? ` (${m.zone})` : ""}`).join(" · ")}
+        </p>
+      ) : null}
+
+      <main className="app crew-shell">
         <AnimatePresence>
           {openUrgent.map((c) => (
             <motion.div key={c.id} className="alarm" role="alert" initial={{ opacity: 0, y: -16, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, height: 0 }} transition={{ ease }}>
@@ -141,32 +246,71 @@ export default function Crew() {
             </motion.div>))}
         </AnimatePresence>
 
+        <AnimatePresence>
+          {state?.turbulence ? (
+            <motion.div className="alarm turbulence" role="alert" initial={{ opacity: 0, y: -16, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, height: 0 }} transition={{ ease }}>
+              <b>揺れ? Turbulence?</b>
+              <span>{state.turbulence.seats.length} phones shook at once, around {rowRange(state.turbulence.seats)} · 複数の端末が一斉に振られました</span>
+              <button className="primary" onClick={() => send({ type: "broadcast", template_id: "turbulence" })}>シートベルト案内 Send seatbelt briefing</button>
+              <button onClick={() => send({ type: "dismiss_turbulence" })}>消す Dismiss</button>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+
         <div className="crew-layout">
           <div className="col">
             <section className="panel">
-              <h2>リクエスト Requests</h2>
+              <h2>リクエスト Requests{myZone !== "all" ? ` · 区画 ${myZone}` : ""}</h2>
               <div className="list">
                 <AnimatePresence initial={false}>
-                  {cards.map((c) => <CardView key={c.id} c={c} cfg={cfg} send={send} onTalk={() => setPb({ seat: c.seat, lang: c.lang })} />)}
+                  {visibleCards.map((c) => <CardView key={c.id} c={c} cfg={cfg} send={send} myName={myName} onTalk={() => setPb({ seat: c.seat })} />)}
                 </AnimatePresence>
-                {!cards.length ? <p className="muted" style={{ margin: 0 }}>リクエストなし · No open requests</p> : null}
+                {!visibleCards.length ? <p className="muted" style={{ margin: 0 }}>リクエストなし · No open requests</p> : null}
               </div>
             </section>
             <section className="panel"><h2>ケアラウンド Care round</h2><Round state={state} LABEL={LABEL} send={send} /></section>
             <section className="panel">
               <h2>乗客のニーズ Passenger needs</h2>
               <p className="muted" style={{ margin: 0 }}>From check-in and the passengers' own settings. Plan who may need help before take-off.</p>
-              <Needs needs={state?.seat_needs || []} LANG_NAME={LANG_NAME} onTalk={(n) => setPb({ seat: n.id, lang: n.lang })} />
+              <Needs needs={state?.seat_needs || []} LANG_NAME={LANG_NAME} onTalk={(n) => setPb({ seat: n.id })} />
             </section>
           </div>
 
           <div className="col">
+            <div className="tabbar" role="tablist">
+              {RIGHT_TABS.filter((t) => t.id !== "chat" || cfg.free_talk).map((t) => (
+                <button key={t.id} type="button" role="tab" aria-selected={rightTab === t.id}
+                  className={`tab ${rightTab === t.id ? "on" : ""}`} onClick={() => setRightTab(t.id)}>
+                  {t.ja}<span className="muted"> {t.en}</span>
+                </button>))}
+            </div>
+
+            {rightTab === "map" ? (
+              <section className="panel cabinmap-panel">
+                <div className="row"><h2 className="grow" style={{ margin: 0 }}>客室図 Cabin map</h2>
+                  <button className="ghost" onClick={refreshBriefing} disabled={briefingLoading}><Icon id="chat" />{briefingLoading ? "…" : "AI briefing"}</button></div>
+                {briefing ? (
+                  <p className="muted" style={{ margin: 0, fontSize: 14 }}>
+                    {briefing.summary || "Nothing needs a summary right now."}
+                  </p>
+                ) : <p className="muted" style={{ margin: 0, fontSize: 13 }}>Tap "AI briefing" for a one-glance read of what needs attention, from the facts already on this screen. Tap any seat for its detail.</p>}
+                <CabinMap state={state} cfg={cfg} exitSeats={exitSeats} selected={pickedSeat} onSelect={(s) => setPickedSeat(s === pickedSeat ? null : s)} />
+              </section>
+            ) : null}
+            <Sheet content={pickedSeat ? (
+              <SeatDetail seat={pickedSeat} state={state} cfg={cfg} send={send} myName={myName} LANG_NAME={LANG_NAME}
+                onTalk={() => setPb({ seat: pickedSeat })} onChat={() => { setRightTab("chat"); setPickedSeat(null); }} />
+            ) : null} onClose={() => setPickedSeat(null)} />
+
+            {rightTab === "safety" ? (
             <section className="panel">
               <h2>安全案内 Safety briefing</h2>
               <div className="row">{cfg.safety.map((x) => <button key={x.id} onClick={() => send({ type: "broadcast", template_id: x.id })}>{x.title.ja} · {x.title.en}</button>)}</div>
               <Safety state={state} cfg={cfg} exitSeats={exitSeats} send={send} />
             </section>
+            ) : null}
 
+            {rightTab === "pa" ? (
             <section className="panel">
               <h2>機内アナウンス字幕 Live PA captions</h2>
               <p className="muted" style={{ margin: 0 }}>Make the announcement as usual, with the tablet listening. Every seat sees it in its own language. Only announcements in the library are captioned; nothing is machine-translated.</p>
@@ -203,7 +347,14 @@ export default function Crew() {
               {state?.pa_log?.length ? <div className="pa-log"><strong>送信履歴 Sent</strong>{state.pa_log.map((a, k) => (
                 <span key={k}><Icon id={a.icon} /> {new Date(a.at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} {a.title_ja} · {a.text_en}</span>))}</div> : null}
             </section>
+            ) : null}
 
+            {rightTab === "chat" && cfg.free_talk ? (<>
+              <CrewLiveConversation conv={conv} send={send} muted={convMuted} onToggleMute={() => setConvMuted((m) => !m)} />
+              <CrewFreeTalk cfg={cfg} LANG_NAME={LANG_NAME} />
+            </>) : null}
+
+            {rightTab === "exit" ? (
             <section className="panel">
               <h2>非常口座席の確認 Exit-row check</h2>
               <p className="muted" style={{ margin: 0 }}>Picture check at boarding. Supports your own briefing and confirmation; it does not replace it.</p>
@@ -215,27 +366,41 @@ export default function Crew() {
                 return <motion.div layout key={c.seat} className="exit-item" title={why}><b>{c.seat}</b><span className={`pill ${tone}`}>{label}</span></motion.div>;
               })}</div>
             </section>
+            ) : null}
           </div>
         </div>
       </main>
 
-      <AnimatePresence>{pb ? <Phrasebook key="pb" cfg={cfg} seat={pb.seat} lang={pb.lang} onLang={(l) => setPb({ ...pb, lang: l })} onClose={() => setPb(null)} /> : null}</AnimatePresence>
+      <AnimatePresence>{pb ? <Phrasebook key="pb" cfg={cfg} seat={pb.seat} onClose={() => setPb(null)} /> : null}</AnimatePresence>
     </>
   );
 }
 
-function CardView({ c, cfg, send, onTalk }) {
+function rowRange(seats) {
+  const rows = [...new Set(seats.map((s) => parseInt(s, 10)))].sort((a, b) => a - b);
+  if (!rows.length) return "";
+  return rows.length === 1 ? `row ${rows[0]}` : `rows ${rows[0]}–${rows[rows.length - 1]}`;
+}
+
+function CardView({ c, cfg, send, myName, onTalk }) {
   const [ja, en, tone] = STATUS[c.status] || ["", c.status, "dim"];
+  const mine = c.claimed_by && c.claimed_by === myName;
+  const takenByOther = c.claimed_by && !mine;
   return (
     <motion.div layout className={`item citem ${c.urgent ? "is-urgent" : ""}`} initial={{ opacity: 0, x: 24 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -24, height: 0, padding: 0, margin: 0 }} transition={{ duration: 0.4, ease }}>
-      <span className="who">{c.seat}</span>
+      <span className="who">{c.seat}{c.zone ? <span className="muted" style={{ fontSize: 11, display: "block" }}>区画 {c.zone}</span> : null}</span>
       <div className="body">
         <div className="what">
           {c.intent ? (<><Icon id={c.intent} /><strong>{c.crew_ja}</strong><span className="muted">{c.label_en}</span></>)
+            : c.translated ? (<><Icon id="globe" /><strong>{c.translated}</strong><span className="pill dim">未確認翻訳 unreviewed translation</span></>)
             : (<><strong>推定 Best guesses:</strong>{c.guesses.map((g) => <span key={g.intent} className="guess"><Icon id={g.intent} />{g.label_ja} ({g.score.toFixed(2)})</span>)}</>)}
           <span className={`pill ${tone}`}>{ja} · {en}</span>
           {c.symptom_ja ? <span className="pill bad symptom"><Icon id={c.symptom_icon} />症状 {c.symptom_ja} · {c.symptom_en}</span> : null}
+          {c.voice_stress != null ? <span className="pill bad" title={`voice-stress heuristic, unvalidated: ${c.voice_stress}`}><Icon id="alert" />声が動揺 Voice sounded distressed</span> : null}
           {c.pictures ? <span className="pill violet" title="This passenger uses picture-only mode">絵のみ · Pictures only</span> : null}
+          {c.source === "shake" ? <span className="pill amber" title="Sent by shaking the phone">📳 振って呼び出し · Shook phone</span> : null}
+          {c.accessibility ? <span className="pill bad" title={ACCESSIBILITY_META[c.accessibility]?.en}><Icon id={ACCESSIBILITY_META[c.accessibility]?.icon} />{ACCESSIBILITY_META[c.accessibility]?.ja}</span> : null}
+          {c.claimed_by ? <span className={`pill ${mine ? "ok" : "dim"}`}><Icon id="person" />{mine ? "自分が対応中 You're on this" : `${c.claimed_by} が対応中`}</span> : null}
         </div>
         {c.heard ? <span className="muted">“{c.heard}” · {c.lang}</span> : null}
         <div className="acts">
@@ -243,9 +408,138 @@ function CardView({ c, cfg, send, onTalk }) {
           {cfg.replies.map((r) => <button key={r.id} title={r.en} onClick={() => send({ type: "reply", card_id: c.id, reply_id: r.id })}>{r.ja}</button>)}
           <button onClick={() => send({ type: "close", card_id: c.id })}>完了 Done</button>
           <button onClick={onTalk}><Icon id="chat" /> 話す Talk</button>
+          {mine ? <button onClick={() => send({ type: "release", card_id: c.id })}>手放す Release</button>
+            : <button disabled={takenByOther} title={takenByOther ? `${c.claimed_by} is already on this` : undefined}
+                onClick={() => send({ type: "claim", card_id: c.id })}>引き受ける Claim</button>}
         </div>
       </div>
     </motion.div>
+  );
+}
+
+function CrewLiveConversation({ conv, send, muted, onToggleMute }) {
+  const openSeats = Object.keys(conv).filter((s) => conv[s]?.open);
+  const [picked, setPicked] = useState(null);
+  const active = picked && openSeats.includes(picked) ? picked : openSeats[0] || null;
+  const thread = active ? conv[active]?.messages || [] : [];
+
+  return (
+    <section className="panel">
+      <div className="row">
+        <span className="panel-title grow">自由会話 Live Conversation <span className="pill dim" style={{ fontWeight: 400, textTransform: "none" }}>unreviewed translation</span></span>
+        <MuteButton muted={muted} onClick={onToggleMute} label={muted ? "音声オフ Unmute" : "音声オン Mute"} />
+        {openSeats.length ? (
+          <select aria-label="Seat" value={active || ""} onChange={(e) => setPicked(e.target.value)}>
+            {openSeats.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        ) : null}
+      </div>
+      {!openSeats.length ? (
+        <p className="muted" style={{ margin: 0 }}>進行中のライブ会話はありません · No Live Conversation panel is open right now.</p>
+      ) : (<>
+        <ConvThread messages={thread} mineFrom="crew" />
+        <form className="row" onSubmit={(e) => {
+          e.preventDefault();
+          const input = e.currentTarget.elements.text; const text = input.value.trim();
+          if (!text) return;
+          send({ type: "conv_text", seat: active, text }); input.value = "";
+        }}>
+          <input className="grow" name="text" autoComplete="off" placeholder="日本語で入力…" />
+          <button className="primary" type="submit">送信 Send</button>
+        </form>
+      </>)}
+    </section>
+  );
+}
+
+function CrewFreeTalk({ cfg, LANG_NAME }) {
+  const [lang, setLang] = useState(cfg.languages[0]?.code || "hi");
+  return (
+    <FreeTalkPanel fromLang="ja" toLang={lang} fromLabel="日本語" toLabel={LANG_NAME[lang] || lang}
+      langPicker={
+        <select aria-label="Passenger language" value={lang} onChange={(e) => setLang(e.target.value)}>
+          {cfg.languages.map((l) => <option key={l.code} value={l.code}>{l.name}</option>)}
+        </select>
+      } />
+  );
+}
+
+function CabinMap({ state, cfg, exitSeats, selected, onSelect }) {
+  if (!state) return null;
+  const heat = state.heatmap || {};
+  const needBySeat = Object.fromEntries((state.seat_needs || []).map((n) => [n.id, n]));
+  const cardsBySeat = {};
+  for (const c of state.cards || []) (cardsBySeat[c.seat] ||= []).push(c);
+  const rows = [...new Set(cfg.seats.map((x) => x.slice(0, -1)))];
+
+  function statusFor(id) {
+    const cards = cardsBySeat[id];
+    if (cards?.some((c) => c.urgent && c.status !== "acknowledged")) return "urgent";
+    if (cards?.length) return "open";
+    return heat[id] === "offline" ? "offline" : "idle";
+  }
+
+  // Laid out like looking down at the plane: each row of the cabin (30, 31, ...) is one column,
+  // read front-to-back left-to-right; the 3 seats on each side of the aisle stack top-to-bottom
+  // within it, with a gap for the aisle itself -- not a spreadsheet of rows and letters.
+  return (
+    <div className="cabinmap">
+      {rows.map((row) => (
+        <div className="cm-row" key={row}>
+          <span className="cm-row-label">{row}</span>
+          <div className="cm-seats">
+            {["A", "B", "C", null, "D", "E", "G", null, "H", "J", "K"].map((letter, i) => {
+              if (!letter) return <span className="cm-aisle" key={`gap-${i}`} />;
+              const id = row + letter;
+              const cards = cardsBySeat[id];
+              const need = needBySeat[id];
+              const bits = [id];
+              if (cards?.length) bits.push(`${cards.length} open request${cards.length > 1 ? "s" : ""}`);
+              if (need?.accessibility) bits.push(ACCESSIBILITY_META[need.accessibility]?.en);
+              if (exitSeats.has(id)) bits.push("exit row");
+              return (
+                <button key={id} type="button" className={`seat ${statusFor(id)} ${exitSeats.has(id) ? "exit" : ""} ${selected === id ? "picked" : ""}`}
+                  title={bits.join(" · ")} aria-label={bits.join(", ")} onClick={() => onSelect(id)}>
+                  {letter}
+                  {need?.accessibility ? <span className="seat-badge"><Icon id={ACCESSIBILITY_META[need.accessibility].icon} /></span> : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>))}
+    </div>
+  );
+}
+
+function SeatDetail({ seat, state, cfg, send, myName, LANG_NAME, onTalk, onChat }) {
+  const cards = (state?.cards || []).filter((c) => c.seat === seat);
+  const need = (state?.seat_needs || []).find((n) => n.id === seat);
+  const lang = need?.lang || "hi";
+  const convOpen = state?.conv_seats?.includes(seat);
+  return (
+    <div key={seat} style={{ display: "contents" }}>
+      <div className="row">
+        <h2 className="grow">{seat}</h2>
+        {need ? <span className="pill dim">{LANG_NAME[need.lang] || need.lang}</span> : null}
+        {need?.accessibility ? <span className="pill bad"><Icon id={ACCESSIBILITY_META[need.accessibility].icon} />{ACCESSIBILITY_META[need.accessibility].en}</span> : null}
+        <span className={`dot ${need?.connected ? "on" : ""}`} title={need?.connected ? "screen connected" : "not connected"} />
+      </div>
+      {convOpen ? (
+        <div className="row">
+          <span className="pill violet"><Icon id="chat" />自由会話中 Live conversation open</span>
+          <button className="ghost" onClick={onChat}>開く Open chat</button>
+        </div>
+      ) : null}
+      {cards.length ? (
+        <div className="list">
+          <AnimatePresence initial={false}>
+            {cards.map((c) => <CardView key={c.id} c={c} cfg={cfg} send={send} myName={myName} onTalk={() => onTalk(c.lang || lang)} />)}
+          </AnimatePresence>
+        </div>
+      ) : (
+        <p className="muted" style={{ margin: 0 }}>No open requests for this seat. <button className="link" onClick={() => onTalk(lang)}>話す Talk</button></p>
+      )}
+    </div>
   );
 }
 
@@ -285,7 +579,7 @@ function Safety({ state, cfg, exitSeats, send }) {
 
 function Needs({ needs, LANG_NAME, onTalk }) {
   if (!needs.length) return <p className="muted" style={{ margin: 0 }}>特記事項なし · Everyone uses English with default settings.</p>;
-  const order = (n) => (n.pictures ? 0 : n.senior ? 1 : 2);
+  const order = (n) => (n.accessibility || n.pictures ? 0 : n.senior ? 1 : 2);
   return (<div className="needs">{[...needs].sort((a, b) => order(a) - order(b) || a.id.localeCompare(b.id)).map((n) => (
     <div key={n.id} className="need">
       <span className={`dot ${n.connected ? "on" : ""}`} title={n.connected ? "screen connected" : "not connected"} />
@@ -293,6 +587,7 @@ function Needs({ needs, LANG_NAME, onTalk }) {
       {n.pictures ? <span className="pill violet">絵のみ · Pictures only</span> : null}
       {n.senior ? <span className="pill ok">大きな文字 · Large text</span> : null}
       {n.read ? <span className="pill dim">読み上げ · Read aloud</span> : null}
+      {n.accessibility ? <span className="pill bad"><Icon id={ACCESSIBILITY_META[n.accessibility]?.icon} />{ACCESSIBILITY_META[n.accessibility]?.ja}</span> : null}
       {n.checked_in ? <span className="muted">チェックイン時 · set at check-in</span> : null}
       <button onClick={() => onTalk(n)}><Icon id="chat" /> 話す Talk</button>
     </div>))}</div>);
@@ -307,7 +602,7 @@ function Round({ state, LABEL, send }) {
       <motion.div layout key={st.seat} className={`stop ${st.care ? "care" : ""} ${st.done ? "done" : ""}`}>
         <span className="n">{k + 1}</span><b>{st.seat}</b>
         <span className="what">{items.map(([i, n]) => <span key={i} className="pill dim"><Icon id={i} />{LABEL[i]?.ja}{n > 1 ? ` ×${n}` : ""}</span>)}
-          {st.care ? <span className="pill violet" title="Has not asked for anything for a while.">声かけ Check-in · {st.care.minutes} 分 min quiet{st.care.pictures ? " · 絵のみ" : st.care.senior ? " · 大きな文字" : ""}</span> : null}</span>
+          {st.care ? <span className="pill violet" title="Has not asked for anything for a while.">声かけ Check-in · {st.care.minutes} 分 min quiet{st.care.accessibility ? ` · ${ACCESSIBILITY_META[st.care.accessibility]?.ja}` : st.care.pictures ? " · 絵のみ" : st.care.senior ? " · 大きな文字" : ""}</span> : null}</span>
         {active && !st.done ? <button onClick={() => send({ type: "stop_done", seat: st.seat })}>完了 Done</button> : <span />}
       </motion.div>);
   };
@@ -332,30 +627,29 @@ function Round({ state, LABEL, send }) {
   </>);
 }
 
-function Phrasebook({ cfg, seat, lang, onLang, onClose }) {
+function Phrasebook({ cfg, seat, onClose }) {
   const PB = cfg.phrasebook;
+  const lang = "en";   // kept simple on purpose: crew's own Japanese plus a universal English fallback
   const [ui, setUi] = useState({});
-  const [voice, setVoice] = useState(false);
   const [phrase, setPhrase] = useState(null);
   const [answer, setAnswer] = useState("");
   const log = useRef([]);
   useEffect(() => {
     fetch(`/api/i18n/${lang}`).then((r) => r.json()).then(setUi).catch(() => setUi({}));
-    canSpeak(lang).then(setVoice);
-    setPhrase(null);
-  }, [lang]);
+  }, []); // eslint-disable-line
   const text = phrase ? phrase.text[lang] || phrase.text.en : "";
-  useEffect(() => { if (phrase && voice) speak(text, lang); setAnswer(""); }, [phrase]); // eslint-disable-line
+  // Always attempt it, rather than hiding the button behind an async voice pre-check that can be
+  // wrong or slow: speak() already no-ops harmlessly if the browser truly has no voice for this.
+  useEffect(() => { if (phrase) speak(text, lang); setAnswer(""); }, [phrase]); // eslint-disable-line
   const answerWith = (ja, en) => {
     setAnswer(`回答: ${ja} · ${en}`);
     log.current.push(`${seat || ""} ${phrase.text.ja} → ${ja} (${en})`);
-    if (voice) speak(ui.thanks || "", lang);
+    speak(ui.thanks || "", lang);
   };
   return (
     <motion.div className="pb" role="dialog" aria-label="Phrasebook" initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 30 }} transition={{ duration: 0.35, ease }}>
       <div className="pb-top">
         <h2>{seat ? `${seat} · ` : ""}会話帳 Phrasebook</h2>
-        <select aria-label="Passenger language" value={lang} onChange={(e) => onLang(e.target.value)}>{cfg.languages.map((l) => <option key={l.code} value={l.code}>{l.name}</option>)}</select>
         <button onClick={onClose}><Icon id="close" /> 閉じる Close</button>
       </div>
       <AnimatePresence mode="wait">
@@ -373,7 +667,7 @@ function Phrasebook({ cfg, seat, lang, onLang, onClose }) {
             <p className="hint">タブレットをお客様に向けてください · Turn the tablet to the passenger</p>
             <p className="bigtext" lang={lang}>{text}</p>
             <p className="muted" style={{ fontSize: 16, margin: 0 }}>{phrase.text.ja} · {phrase.text.en}</p>
-            {voice ? <div><button onClick={() => speak(text, lang)}><Icon id="speaker" /> もう一度 Again</button></div> : null}
+            <div><button onClick={() => speak(text, lang)}><Icon id="speaker" /> もう一度 Again</button></div>
             {phrase.yes_no ? <div className="answers">
               <button className="yes" onClick={() => answerWith("はい", "Yes")}>{ui.yes || "Yes"}</button>
               <button className="no" onClick={() => answerWith("いいえ", "No")}>{ui.no || "No"}</button>
