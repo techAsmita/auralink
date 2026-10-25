@@ -3,7 +3,7 @@
 import "./crew.css";
 import { AnimatePresence, motion } from "framer-motion";
 import { Fragment, useEffect, useRef, useState } from "react";
-import { Recorder, connect, crewFetch, loadConfig, toBase64 } from "@/lib/hub";
+import { Recorder, connect, crewFetch, loadConfig, postJson, toBase64 } from "@/lib/hub";
 import { Icon } from "@/lib/icons";
 import { Picto } from "@/lib/pictograms";
 import { ACCESSIBILITY_META } from "@/lib/accessibility";
@@ -33,12 +33,17 @@ const RIGHT_TABS = [
   { id: "pa", ja: "アナウンス", en: "Announcements" },
   { id: "chat", ja: "会話", en: "Live chat" },
   { id: "exit", ja: "非常口", en: "Exit check" },
+  { id: "arrival", ja: "遺失物・意見", en: "Lost & found" },
 ];
+const LOST_STATUS = { reported: ["報告済み", "Reported", "amber"], found: ["発見", "Found", "ok"], returned: ["返却済み", "Returned", "dim"] };
+const FEEDBACK_CATEGORY = { inconvenience: ["不便", "Inconvenience", "bad"], improvement: ["提案", "Suggestion", "amber"], compliment: ["お褒めの言葉", "Compliment", "ok"] };
+const HUB_DOWN_AFTER_MS = 6000;   // hub.js retries every 1s; a handful of failed tries, not one blip
 
 export default function Crew() {
   const [cfg, setCfg] = useState(null);
   const [state, setState] = useState(null);
   const [online, setOnline] = useState(false);
+  const [hubDown, setHubDown] = useState(false);   // sustained (not a 1s retry blip): show the fail-safe banner
   const [soundOn, setSoundOn] = useState(true);
   const [readAloud, setReadAloud] = useState(false);
   const [convMuted, setConvMuted] = useState(false);
@@ -53,10 +58,11 @@ export default function Crew() {
   const [paPick, setPaPick] = useState(null);
   const [paN, setPaN] = useState("");
   const [paRecOn, setPaRecOn] = useState(false);
+  const [paLive, setPaLive] = useState(null);   // caption taking shape while still recording, or null
   const [myName, setMyName] = useState("");
   const [myZone, setMyZone] = useState("all");
   const myInfo = useRef({ name: "", zone: "all" });
-  const socket = useRef(null), audio = useRef(null), paRec = useRef(null);
+  const socket = useRef(null), audio = useRef(null), paRec = useRef(null), paLiveBusy = useRef(false), hubDownTimer = useRef(0);
   const seenUrgent = useRef(new Set()), announced = useRef(null), announcedSymptom = useRef(new Set());
   const opts = useRef({ soundOn: true, readAloud: false, convMuted: false }); opts.current = { soundOn, readAloud, convMuted };
 
@@ -139,9 +145,19 @@ export default function Crew() {
           // crew's reply in their own language (app/passenger/page.jsx's onMessage)
           if (msg.from === "passenger" && msg.done && msg.translated && !opts.current.convMuted) speak(msg.translated, "ja");
         }
-      }, (on) => { setOnline(on); if (on && myInfo.current.name) sendHello(myInfo.current.name, myInfo.current.zone); });
+      }, (on) => {
+        setOnline(on);
+        if (on) {
+          clearTimeout(hubDownTimer.current); hubDownTimer.current = 0; setHubDown(false);
+          if (myInfo.current.name) sendHello(myInfo.current.name, myInfo.current.zone);
+        } else if (!hubDownTimer.current) {
+          // same fails-safe idea as the passenger phone (app/passenger/page.jsx): only arm on the
+          // first failed retry, since hub.js keeps retrying every 1s and each one calls this again
+          hubDownTimer.current = setTimeout(() => { hubDownTimer.current = 0; setHubDown(true); }, HUB_DOWN_AFTER_MS);
+        }
+      });
     });
-    return () => { socket.current?.close(); removeEventListener("pointerdown", unlock); };
+    return () => { socket.current?.close(); clearTimeout(hubDownTimer.current); removeEventListener("pointerdown", unlock); };
   }, []); // eslint-disable-line
 
   const send = (m) => socket.current?.send(m);
@@ -173,6 +189,19 @@ export default function Crew() {
       setPa(r); setPaPick(pick); setPaN(pick?.n || "");
     } catch (err) { setPa({ error: err.message }); }
   }
+  // While the crew keeps recording, show the caption taking shape -- a quick re-match on a growing
+  // snapshot of the same audio, with the fast model (never what gets sent; `paMic`'s final match
+  // after Stop always re-runs on the accurate model, same as before this existed). Never overlaps
+  // itself: a snapshot that arrives while the last one is still matching is simply dropped.
+  async function paMatchLive(buf) {
+    if (paLiveBusy.current) return;
+    paLiveBusy.current = true;
+    try {
+      const res = await crewFetch("/api/pa/match", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audio_b64: await toBase64(buf), fast: true }) });
+      if (res.ok) setPaLive(await res.json());
+    } catch { /* a dropped live preview is not worth surfacing; the final match still runs on Stop */ }
+    paLiveBusy.current = false;
+  }
   async function paSend() {
     const n = paN.trim().toUpperCase() || null;
     const res = await crewFetch("/api/pa/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: paPick.id, n }) });
@@ -183,10 +212,11 @@ export default function Crew() {
     if (!paRec.current) {
       if (!Recorder.supported()) { setPa({ error: "マイク不可 Microphone needs https or localhost" }); return; }
       paRec.current = new Recorder();
-      try { await paRec.current.start(28, () => paRec.current && paMic()); } catch { paRec.current = null; return; }
+      setPaLive(null);
+      try { await paRec.current.start(28, () => paRec.current && paMic(), null, (buf) => paMatchLive(buf)); } catch { paRec.current = null; return; }
       setPaRecOn(true);
     } else {
-      const pcm = await paRec.current.stop(); paRec.current = null; setPaRecOn(false);
+      const pcm = await paRec.current.stop(); paRec.current = null; setPaRecOn(false); setPaLive(null);
       paMatch({ audio_b64: await toBase64(pcm) });
     }
   }
@@ -247,6 +277,15 @@ export default function Crew() {
         </AnimatePresence>
 
         <AnimatePresence>
+          {hubDown ? (
+            <motion.div className="alarm hub-down" role="alert" initial={{ opacity: 0, y: -16, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, height: 0 }} transition={{ ease }}>
+              <Icon id="wifi_off" /><b>ハブ接続なし Hub connection lost</b>
+              <span>This tablet can't reach the cabin hub. New requests may not be showing. Print your offline backup (乗客のニーズ Passenger needs panel) if you haven't, and walk the cabin.</span>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+
+        <AnimatePresence>
           {state?.turbulence ? (
             <motion.div className="alarm turbulence" role="alert" initial={{ opacity: 0, y: -16, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, height: 0 }} transition={{ ease }}>
               <b>揺れ? Turbulence?</b>
@@ -272,6 +311,10 @@ export default function Crew() {
             <section className="panel">
               <h2>乗客のニーズ Passenger needs</h2>
               <p className="muted" style={{ margin: 0 }}>From check-in and the passengers' own settings. Plan who may need help before take-off.</p>
+              <div className="row">
+                <button className="ghost" title="Print a paper backup of this list -- seat, language, accessibility -- for if the tablet or hub goes down mid-flight and you have to walk the cabin without it." onClick={() => window.print()}>
+                  <Icon id="print" /> バックアップ印刷 Print offline backup</button>
+              </div>
               <Needs needs={state?.seat_needs || []} LANG_NAME={LANG_NAME} onTalk={(n) => setPb({ seat: n.id })} />
             </section>
           </div>
@@ -294,6 +337,7 @@ export default function Crew() {
                     {briefing.summary || "Nothing needs a summary right now."}
                   </p>
                 ) : <p className="muted" style={{ margin: 0, fontSize: 13 }}>Tap "AI briefing" for a one-glance read of what needs attention, from the facts already on this screen. Tap any seat for its detail.</p>}
+                <MapLegend />
                 <CabinMap state={state} cfg={cfg} exitSeats={exitSeats} selected={pickedSeat} onSelect={(s) => setPickedSeat(s === pickedSeat ? null : s)} />
               </section>
             ) : null}
@@ -320,6 +364,16 @@ export default function Crew() {
                   <input className="grow" name="pa" autoComplete="off" placeholder="…or type it: We have started our descent, 20 minutes" aria-label="Typed announcement" />
                   <button type="submit">照合 Match</button></form>
               </div>
+              <AnimatePresence>
+                {paRecOn && paLive?.heard ? (
+                  <motion.div className="pa-live" aria-live="polite" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                    <Icon id="mic" /><span className="muted">認識中 Hearing…</span> “{paLive.heard}”
+                    {paLive.verdict !== "none" && paLive.matches?.[0] ? (
+                      <span className="pill dim">→ {paLive.matches[0].title_ja} · {paLive.matches[0].title_en}</span>
+                    ) : null}
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
               <div className="pa-result" aria-live="polite">
                 {pa?.busy ? <span className="muted">照合中… Matching…</span> : null}
                 {pa?.error ? <span className="pill bad">エラー Error: {pa.error}</span> : null}
@@ -367,11 +421,41 @@ export default function Crew() {
               })}</div>
             </section>
             ) : null}
+
+            {rightTab === "arrival" ? (
+            <section className="panel">
+              <h2>遺失物 Lost &amp; found</h2>
+              <div className="exit-list">
+                {(state?.lost_items || []).map((it) => (
+                  <motion.div layout key={it.id} className="item">
+                    <b>{it.seat}</b><span className="grow muted">{it.description}</span>
+                    <span className={`pill ${LOST_STATUS[it.status][2]}`}>{LOST_STATUS[it.status][0]} · {LOST_STATUS[it.status][1]}</span>
+                    {it.status !== "found" ? <button onClick={() => postJson(`/api/lost-item/${it.id}/status`, { status: "found" }, { crew: true }).catch(() => {})}>発見 Found</button> : null}
+                    {it.status !== "returned" ? <button onClick={() => postJson(`/api/lost-item/${it.id}/status`, { status: "returned" }, { crew: true }).catch(() => {})}>返却 Returned</button> : null}
+                  </motion.div>
+                ))}
+                {!state?.lost_items?.length ? <p className="muted" style={{ margin: 0 }}>報告なし · Nothing reported</p> : null}
+              </div>
+              <h2>ご意見 Feedback</h2>
+              <div className="exit-list">
+                {(state?.feedback || []).map((f) => (
+                  <motion.div layout key={f.id} className="item">
+                    <b>{f.seat}</b>
+                    <span className={`pill ${FEEDBACK_CATEGORY[f.category][2]}`}>{FEEDBACK_CATEGORY[f.category][0]} · {FEEDBACK_CATEGORY[f.category][1]}</span>
+                    {f.rating ? <span className="pill dim">{"★".repeat(f.rating)}{"☆".repeat(5 - f.rating)}</span> : null}
+                    <span className="grow muted">{f.message}</span>
+                  </motion.div>
+                ))}
+                {!state?.feedback?.length ? <p className="muted" style={{ margin: 0 }}>フィードバックなし · No feedback yet</p> : null}
+              </div>
+            </section>
+            ) : null}
           </div>
         </div>
       </main>
 
       <AnimatePresence>{pb ? <Phrasebook key="pb" cfg={cfg} seat={pb.seat} onClose={() => setPb(null)} /> : null}</AnimatePresence>
+      <OfflineRoster needs={state?.seat_needs || []} LANG_NAME={LANG_NAME} exitSeats={exitSeats} />
     </>
   );
 }
@@ -388,7 +472,10 @@ function CardView({ c, cfg, send, myName, onTalk }) {
   const takenByOther = c.claimed_by && !mine;
   return (
     <motion.div layout className={`item citem ${c.urgent ? "is-urgent" : ""}`} initial={{ opacity: 0, x: 24 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -24, height: 0, padding: 0, margin: 0 }} transition={{ duration: 0.4, ease }}>
-      <span className="who">{c.seat}{c.zone ? <span className="muted" style={{ fontSize: 11, display: "block" }}>区画 {c.zone}</span> : null}</span>
+      <span className="who">{c.seat}
+        {c.name ? <span className="muted" style={{ fontSize: 11, display: "block", fontWeight: 600 }} title="From a scanned boarding pass">{c.name}</span> : null}
+        {c.zone ? <span className="muted" style={{ fontSize: 11, display: "block" }}>区画 {c.zone}</span> : null}
+      </span>
       <div className="body">
         <div className="what">
           {c.intent ? (<><Icon id={c.intent} /><strong>{c.crew_ja}</strong><span className="muted">{c.label_en}</span></>)
@@ -464,6 +551,24 @@ function CrewFreeTalk({ cfg, LANG_NAME }) {
   );
 }
 
+// Cabin map colour key, so crew don't have to guess what a colour means mid-flight.
+// Keep in sync with CabinMap's statusFor() and crew.css's .cabinmap .seat.* rules.
+const MAP_LEGEND = [
+  ["urgent", "var(--bad)", "至急 Urgent", "e.g. possible medical"],
+  ["accessibility", "var(--violet)", "要配慮 Accessibility", "request from a passenger with an accessibility need"],
+  ["open", "var(--warn)", "対応待ち Open request", "waiting, not yet urgent"],
+  ["idle", "var(--idle)", "リクエストなし No request", ""],
+];
+function MapLegend() {
+  return (
+    <div className="map-legend" role="note" aria-label="Cabin map colour key">
+      {MAP_LEGEND.map(([key, color, label, hint]) => (
+        <span key={key} className="map-legend-item" title={hint || undefined}><i className="sw" style={{ background: color }} />{label}</span>
+      ))}
+    </div>
+  );
+}
+
 function CabinMap({ state, cfg, exitSeats, selected, onSelect }) {
   if (!state) return null;
   const heat = state.heatmap || {};
@@ -475,6 +580,7 @@ function CabinMap({ state, cfg, exitSeats, selected, onSelect }) {
   function statusFor(id) {
     const cards = cardsBySeat[id];
     if (cards?.some((c) => c.urgent && c.status !== "acknowledged")) return "urgent";
+    if (cards?.some((c) => c.accessibility)) return "accessibility";
     if (cards?.length) return "open";
     return heat[id] === "offline" ? "offline" : "idle";
   }
@@ -519,7 +625,7 @@ function SeatDetail({ seat, state, cfg, send, myName, LANG_NAME, onTalk, onChat 
   return (
     <div key={seat} style={{ display: "contents" }}>
       <div className="row">
-        <h2 className="grow">{seat}</h2>
+        <h2 className="grow">{seat}{need?.name ? <span className="muted" style={{ fontSize: 15, fontWeight: 500 }}> · {need.name}</span> : null}</h2>
         {need ? <span className="pill dim">{LANG_NAME[need.lang] || need.lang}</span> : null}
         {need?.accessibility ? <span className="pill bad"><Icon id={ACCESSIBILITY_META[need.accessibility].icon} />{ACCESSIBILITY_META[need.accessibility].en}</span> : null}
         <span className={`dot ${need?.connected ? "on" : ""}`} title={need?.connected ? "screen connected" : "not connected"} />
@@ -577,13 +683,42 @@ function Safety({ state, cfg, exitSeats, send }) {
   </>);
 }
 
+// Fails safe: printed in advance (Passenger needs -> "Print offline backup"), this is the one
+// thing that still works once the tablet can't reach the hub -- walk the cabin with paper instead
+// of a live screen. Invisible on screen; CSS (crew.css) shows only this and hides everything else
+// when the browser is told to print, same trick as the boarding-time seat QR cards (app/seats).
+function OfflineRoster({ needs, LANG_NAME, exitSeats }) {
+  return (
+    <div className="offline-roster">
+      <h1>Auralink — オフライン控え Offline backup</h1>
+      <p>Printed {new Date().toLocaleString()}. If the tablet or hub stops working, walk the cabin
+        and check these seats first -- their language, accessibility and any other noted needs.
+        Exit rows: {[...exitSeats].sort().join(", ") || "none set"}.</p>
+      {needs.length ? (
+        <table>
+          <thead><tr><th>Seat 座席</th><th>Language 言語</th><th>Accessibility 配慮事項</th><th>Notes</th></tr></thead>
+          <tbody>
+            {[...needs].sort((a, b) => a.id.localeCompare(b.id)).map((n) => (
+              <tr key={n.id}>
+                <td>{n.id}</td>
+                <td>{LANG_NAME[n.lang] || n.lang}</td>
+                <td>{n.accessibility ? `${ACCESSIBILITY_META[n.accessibility]?.en} · ${ACCESSIBILITY_META[n.accessibility]?.ja}` : ""}</td>
+                <td>{[n.pictures && "Pictures only", n.senior && "Large text", n.read && "Read aloud"].filter(Boolean).join(", ")}</td>
+              </tr>))}
+          </tbody>
+        </table>
+      ) : <p>No special needs recorded -- everyone is using English with default settings.</p>}
+    </div>
+  );
+}
+
 function Needs({ needs, LANG_NAME, onTalk }) {
   if (!needs.length) return <p className="muted" style={{ margin: 0 }}>特記事項なし · Everyone uses English with default settings.</p>;
   const order = (n) => (n.accessibility || n.pictures ? 0 : n.senior ? 1 : 2);
   return (<div className="needs">{[...needs].sort((a, b) => order(a) - order(b) || a.id.localeCompare(b.id)).map((n) => (
     <div key={n.id} className="need">
       <span className={`dot ${n.connected ? "on" : ""}`} title={n.connected ? "screen connected" : "not connected"} />
-      <b>{n.id}</b><span className="pill dim">{LANG_NAME[n.lang] || n.lang}</span>
+      <b>{n.id}</b>{n.name ? <span className="muted">{n.name}</span> : null}<span className="pill dim">{LANG_NAME[n.lang] || n.lang}</span>
       {n.pictures ? <span className="pill violet">絵のみ · Pictures only</span> : null}
       {n.senior ? <span className="pill ok">大きな文字 · Large text</span> : null}
       {n.read ? <span className="pill dim">読み上げ · Read aloud</span> : null}

@@ -5,7 +5,9 @@
 
   <p><strong>Every passenger, understood.</strong></p>
   <p>Repair-first communication between airline passengers and cabin crew, across accents, languages and a loud cabin.<br />
-  When speech is unclear, Auralink <strong>asks the passenger one simple question</strong> instead of guessing.</p>
+  When speech is unclear, Auralink <strong>asks the passenger one simple question</strong> instead of guessing.<br />
+  A guided onboarding assistant welcomes every passenger in their own language, and one shared scanner replaces a
+  QR code per seat.</p>
 
   <p>
     <a href="https://github.com/goyalnishtha841/auralink/actions/workflows/tests.yml"><img src="https://github.com/goyalnishtha841/auralink/actions/workflows/tests.yml/badge.svg" alt="tests" /></a>
@@ -38,19 +40,29 @@ Every sentence a passenger or crew member reads comes from a reviewed template.
 
 <table>
   <tr>
-    <td width="32%" valign="top"><img src="docs/images/passenger.jpg" alt="Passenger phone in Hindi asking 'Did you mean: water?' with a yes/no button and an icon grid" /><br /><sub><b>Passenger phone.</b> No app to install: scan the seat QR. Asks instead of guessing, in the passenger's language, with pictures.</sub></td>
-    <td width="68%" valign="top"><img src="docs/images/crew.png" alt="Crew tablet in Japanese with an urgent possible-medical card for seat 31C, safety briefing seat map and live PA captions" /><br /><sub><b>Crew tablet, in Japanese.</b> Urgent requests jump the queue before the passenger has even confirmed. Also on this screen: the safety-briefing heat map, care rounds, passenger needs and live PA captions.</sub></td>
+    <td width="32%" valign="top"><img src="docs/images/onboarding.jpg" alt="A guided onboarding screen: 'Welcome aboard!' with an illustrated crew-avatar assistant in front of a cabin window, and a 'Let's get started' button" /><br /><sub><b>Onboarding assistant.</b> Every first-time passenger gets a short, skippable tour from an illustrated crew avatar, before anything else.</sub></td>
+    <td width="32%" valign="top"><img src="docs/images/languages.jpg" alt="Onboarding language picker listing English, Hindi, Tamil, Thai, Chinese, Spanish, French, Italian and more" /><br /><sub><b>16 languages.</b> Every onboarding screen, request and crew reply is fully translated, not just the ones Auralink can speak aloud.</sub></td>
+    <td width="32%" valign="top"><img src="docs/images/seat-picker.jpg" alt="A tap-your-seat cabin map, a 'Tap to say your seat number' microphone button, and a 'Scan boarding pass' option" /><br /><sub><b>One shared scanner.</b> No screen at every seat? One QR code for the whole cabin: tap a seat, say it, or scan a boarding pass.</sub></td>
   </tr>
   <tr>
-    <td colspan="2"><img src="docs/images/judge.png" alt="Under-the-hood view: the sentence, the words that matter, the split rule, and a scored bar for each candidate intent with the t1 threshold" /><br /><sub><b>Under the hood (the jury screen).</b> Every decision in the open: which words mattered, which rule fired, and how each request was scored against the thresholds.</sub></td>
+    <td width="32%" valign="top"><img src="docs/images/passenger.jpg" alt="Passenger phone in Hindi asking 'Did you mean: water?' with a yes/no button and an icon grid" /><br /><sub><b>Passenger phone.</b> Asks instead of guessing, in the passenger's language, with pictures.</sub></td>
+    <td width="32%" valign="top"><img src="docs/images/crew.jpg" alt="Crew tablet in Japanese with an urgent possible-medical card for seat 34K, water and blanket request cards, safety briefing seat map and live PA captions" /><br /><sub><b>Crew tablet, in Japanese.</b> Urgent requests jump the queue before the passenger has even confirmed.</sub></td>
+    <td width="32%" valign="top"><img src="docs/images/cabin-map.jpg" alt="Crew cabin map with a colour key: red for urgent, violet for accessibility, amber for an open request, grey for no request" /><br /><sub><b>Cabin map, at a glance.</b> A seat with an accessibility profile on file is shown in violet, distinct from a plain open request.</sub></td>
+  </tr>
+  <tr>
+    <td colspan="3"><img src="docs/images/judge.png" alt="Under-the-hood view: the sentence, the words that matter, the split rule, and a scored bar for each candidate intent with the t1 threshold" /><br /><sub><b>Under the hood (the jury screen).</b> Every decision in the open: which words mattered, which rule fired, and how each request was scored against the thresholds.</sub></td>
   </tr>
 </table>
+
+<p align="center"><a href="https://auralink-o11a.onrender.com/start"><strong>▶ Live demo</strong></a> -- open <code>/start</code> for the three-step walkthrough, passenger and crew PIN<br />
+<sub>Render's free tier sleeps after inactivity, so the first open can take up to a minute, and Free Talk's translation/voice is dropped (see <a href="#deploying-a-live-demo">deploying a live demo</a>).</sub></p>
 
 ## Contents
 
 - [How it works](#how-it-works) · [Results](#results) · [Features](#features)
 - [Run it](#run-it) · [On phones](#on-phones) · [Testing and CI](#testing-and-ci)
-- [Feature guide](#feature-guide) · [For developers](#for-developers) · [Evaluation](#evaluation)
+- [Feature guide](#feature-guide) · [Deploying a live demo](#deploying-a-live-demo)
+- [For developers](#for-developers) · [Evaluation](#evaluation)
 
 ## How it works
 
@@ -124,20 +136,49 @@ matching, and **1.0–1.2 s** from the end of speech to the confirm screen (targ
 
 ## Features
 
+- **A guided onboarding assistant**: a short, skippable tour from an illustrated crew avatar on a
+  passenger's first visit, fully translated into 16 languages, not just the ones Auralink can speak aloud
+  ([onboarding assistant](#onboarding-assistant))
+- **One shared scanner for the whole cabin**: tap a seat on a map, say it out loud, or scan a boarding
+  pass — no screen (and no printed QR code) needed at every seat ([shared scanner](#shared-cabin-scanner))
 - **Voice, text or icons, in the passenger's language**: Whisper n-best plus a phonetic matcher, with a
   confirm step instead of guessing ([what is real](#what-is-real-and-what-is-a-placeholder))
 - **Accent-aware matching** with hand-set and learned accent costs ([evaluation](#evaluation),
   [learned costs](#learned-accent-costs))
+- **Accessibility as a first-class signal**: a passenger's accessibility profile follows them from
+  check-in onto the crew's cabin map, shown in its own colour, distinct from a plain open request
+  ([cabin-map colours](#cabin-map-accessibility-colours))
 - **Safety briefing that checks understanding**: a live seat heat map of who understood, who wants it
   explained again, and an exit-row check
 - **Check-in at the gate** for language and accessibility needs ([check-in](#check-in-the-airport-stage))
+- **Medical triage**: an urgent medical request asks one follow-up question -- which symptom -- before
+  it reaches the crew ([medical triage](#medical-triage))
+- **Free Talk and Live Conversation**: open-vocabulary offline translation for anything outside the
+  fixed, reviewed request list -- a one-shot suggestion, or a free-running two-way chat
+  ([Free Talk and Live Conversation](#free-talk-and-live-conversation))
+- **Crew phrasebook**: common phrases already translated into a passenger's language, one tap away
+  on the crew tablet ([crew phrasebook](#crew-phrasebook))
+- **Shake to call** and **turbulence detection**: shake the phone instead of finding a button; crew
+  see several seats shaking at once as turbulence, not a flood of calls
+  ([shake to call and turbulence detection](#shake-to-call-and-turbulence-detection))
 - **Read aloud** with the phone's offline voice ([read aloud](#read-aloud))
 - **Live PA captions** from pre-approved announcements, never machine translation ([PA captions](#live-pa-captions))
 - **Care rounds**: one trolley loop for open requests and check-ins for quiet passengers ([care rounds](#care-rounds))
+- **After landing**: gate, baggage and connecting-flight info, a seat-tied lost-item report that
+  reaches the crew tablet live, and post-flight feedback, all in the passenger's own language
+  ([after landing](#after-landing))
+- **Flight report**: requests by outcome, type and language, recovery rate, safety comprehension,
+  care rounds and post-flight feedback, since the last cabin reset, with a CSV download
+  ([demo day](#demo-day))
 - **Crash recovery**: cabin state survives a hub restart ([crash recovery](#crash-recovery))
+- **Fails safe**: no hub, no network -- passenger phones fall back to a no-server pictogram card
+  and crew can print an offline backup seat list ([fails safe](#fails-safe-no-hub-no-network))
 - **Crew PIN**: crew, presenter, report and jury screens are locked on the shared cabin Wi-Fi ([crew PIN](#crew-pin))
 - **New languages without code or retraining** ([adding a language](#adding-a-language-no-code-no-retraining)):
-  Hindi, Tamil, Thai, English and Hinglish today
+  16 languages of onboarding and request text today, with speech recognition and offline voice in
+  English, Hindi, Tamil and Thai
+- **Deployable as a live demo in minutes**: Docker, a free Render web service, a free Hugging Face
+  Space, or a one-command tunnel from a laptop ([deploying a live demo](#deploying-a-live-demo))
 - **Voice collection** for the held-out evaluation set ([collecting voices](#collecting-voices))
 
 ## Run it
@@ -149,16 +190,22 @@ brew install espeak-ng          # phoneme matcher; apt install espeak-ng on Linu
 scripts/run.sh
 ```
 
-**Then open the Start page address the script prints (usually <http://localhost:8000/start.html>) on the same laptop.** The Start page explains everything in
-plain words: how phones reach the laptop with no internet, the seat QR code to scan, the crew PIN (shown
+**Then open the Start page address the script prints (usually <http://localhost:8000/start>) on the same laptop.** The Start page explains everything in
+plain words: how phones reach the laptop with no internet, how a passenger finds their seat, the crew PIN (shown
 only on this laptop), and what every page is for. To try it alone, open **Passenger** and **Crew** side by
 side, choose a language on the passenger screen, and type "thoda wotter and kambal".
 
 | Who | Opens | How |
 |---|---|---|
-| Passenger | `/passenger.html?seat=34K` | Scans the QR code on the seat (print them from `/seats.html`); picks a language the first time |
-| Cabin crew | `/crew.html` | Tablet on the same Wi-Fi; enters the crew PIN once |
-| Jury | `/judge.html` | Under the hood: how each request was understood (crew PIN) |
+| Passenger | `/passenger` | One shared scanner for the whole cabin: tap a seat on the map, say it, or scan a boarding pass. A first-time seat also gets the onboarding assistant |
+| Passenger (direct) | `/passenger?seat=34K` | A printable per-seat QR still works too (print them from `/seats`); picks a language the first time |
+| Passenger, after landing | `/arrival?seat=34K` | Gate, baggage and connections; a lost-item report; post-flight feedback -- reachable from the passenger screen's header icon |
+| Cabin crew | `/crew` | Tablet on the same Wi-Fi; enters the crew PIN once |
+| Jury | `/judge` | Under the hood: how each request was understood (crew PIN) |
+
+The current screens are a Next.js app (`web/`), built to `web/out/` and served by the hub at these same
+paths (a `.html` suffix, e.g. `/passenger.html`, still works too). An older, plain HTML/JS set of screens
+ships alongside it as a fallback: `AURALINK_UI=classic scripts/run.sh`.
 
 Port 8000 busy (another app, for example another project's server)? `scripts/run.sh` and
 `scripts/demo.sh` then pick the next free port by themselves (8001, 8002 ...) and print the exact address,
@@ -220,10 +267,23 @@ certificate on each demo phone.
 
 </details>
 
+## Deploying a live demo
+
+| Option | Use when | How |
+|---|---|---|
+| Docker (full) | A persistent server with a few GB RAM, e.g. an Oracle Cloud Always Free Ampere VM | `docker compose up -d` (`Dockerfile`, `docker-compose.yml`, `Caddyfile` — automatic HTTPS) |
+| Render free web service | A free, no-card, always-on-ish link, trading away Free Talk's translation/voice | Connect the repo on Render as a **Blueprint** (`render.yaml` → `Dockerfile.render`, a trimmed build) -- live at [auralink-o11a.onrender.com](https://auralink-o11a.onrender.com/start) |
+| Hugging Face Spaces | A free, no-card, full-featured link with more RAM than Render's free tier | Push to a Space's git remote (SDK: Docker — add a `title`/`emoji`/`sdk: docker`/`app_port: 8000` YAML front matter block to the top of this file first; Spaces reads it from there) |
+| Cloudflare Quick Tunnel | Fastest: a public HTTPS link to a hub already running on your own laptop | `cloudflared tunnel --url http://localhost:8000` |
+
+Render's free 512 MB tier can't hold Free Talk's translation/voice models, so `Dockerfile.render` drops
+them (`requirements-render.txt`); everything else — onboarding, the shared scanner, requests, the crew
+tablet — is unaffected, since `engine/translate.py` and `engine/tts.py` degrade gracefully without them.
+
 ### Testing and CI
 
 ```bash
-.venv/bin/python -m pytest -q    # 99 tests
+.venv/bin/python -m pytest -q    # 172 tests (3 skip without Whisper: AURALINK_SKIP_WHISPER=1)
 .venv/bin/ruff check .
 ```
 
@@ -241,6 +301,80 @@ need the Whisper model are skipped there (`AURALINK_SKIP_WHISPER=1`), so CI neve
 | `apps/` | D | Original plain HTML/JS screens, kept as a fallback (`AURALINK_UI=classic scripts/run.sh`) |
 
 ## Feature guide
+
+### Onboarding assistant
+
+`/passenger` with no seat (or a first-ever visit to a seat) opens a short, skippable tour hosted by an
+illustrated crew avatar: welcome, language, what Auralink can do, a demo request, a picture-only mode,
+announcements, accessibility and a wrap-up. Text is fully translated into 16 languages
+(`web/components/onboarding.jsx`); spoken narration uses the hub's offline voice where available and
+falls back to the browser's own, with a note when it can't speak a language yet. Completion is
+remembered per seat in `localStorage`, and a floating button replays it, asks for help, or changes
+language/accessibility settings at any time.
+
+### Shared cabin scanner
+
+Not every seat has a screen, so `/passenger` with no `?seat=` shows one tap-your-seat cabin map instead
+of needing a QR code at every seat. Three ways in: tap a seat, say its number (offline speech, same
+matcher as every other request), or **Scan boarding pass** — every real boarding pass carries an
+IATA BCBP barcode (`hub/bcbp.py`) with the seat on it, decoded entirely client-side. Per-seat QR codes
+(`/seats`) still work as a direct alternative. `/boarding-pass` issues a test boarding pass for demos.
+
+### Cabin-map accessibility colours
+
+On the crew tablet's cabin map, a seat with an accessibility profile on file (from check-in or the
+passenger's own settings) is shown in violet, distinct from a plain open request (amber) — urgent
+(red) still wins if both apply. The colour key is shown above the map and on the Start page FAQ.
+
+### Medical triage
+
+When a request matches the `medical` intent, before it reaches the crew the passenger's phone asks
+one follow-up question -- "What's wrong? Tap one." -- from a small picture list (chest pain,
+breathing, fainting, allergic reaction, bleeding, other). Whatever they tap travels with the request
+card, so the crew tablet shows not just "medical" but the symptom itself, in Japanese and English,
+before anyone has walked to the seat. Medical and other urgent requests always skip the confirm step
+and the care-round queue. Logic: `set_symptom`/`ask_symptom` in [hub/state.py](hub/state.py) and
+[hub/main.py](hub/main.py); the question and symptom list are in `data/templates/messages.json`'s
+`triage` section.
+
+### Free Talk and Live Conversation
+
+Two tiers of open-vocabulary translation sit alongside the fixed, reviewed request list -- both
+explicitly tagged "machine-translated, not reviewed" and never used for safety briefings, exit-row
+checks or PA captions:
+
+- **Free Talk**: when nothing in the fixed list matches what a passenger said, the "I'm not fully
+  sure" sheet offers a one-shot translation of what was heard, which the passenger can choose to
+  send to crew as-is (`POST /api/freetalk/translate`).
+- **Live Conversation**: the chat icon on both the passenger and crew screens opens a free-running,
+  two-way, streaming-translated conversation for anything a request card doesn't cover -- each turn
+  is transcribed, translated and spoken aloud in the other person's language in near real time
+  (`hub/main.py` `handle_conv_audio`/`handle_conv_text`; UI in
+  [web/components/liveconversation.jsx](web/components/liveconversation.jsx)).
+
+Both run on an offline NLLB-200 (distilled, 600M parameters) through CTranslate2 at `int8`
+([engine/translate.py](engine/translate.py)), the same pattern `engine/asr.py` uses for Whisper --
+downloaded once (~2.4 GB), then fully offline. Needs `pip install transformers`; set
+`AURALINK_FREE_TALK=0` to turn it off on a laptop that would rather keep the RAM for Whisper (Free
+Talk is dropped entirely from the trimmed Render build, see
+[deploying a live demo](#deploying-a-live-demo)).
+
+### Crew phrasebook
+
+A quick-reference panel on the crew tablet (open **Talk** on any seat) with everyday phrases --
+greetings, directions, reassurance -- already translated into that passenger's language: for
+anything a one-tap reply template doesn't cover and a full Live Conversation turn would be slower
+for. Source: `data/templates/messages.json`'s `phrasebook` section, served at `/api/config` and
+reloaded with the rest of the templates whenever the file changes.
+
+### Shake to call and turbulence detection
+
+A passenger can shake their phone instead of finding the **Call crew** button: three jolts within
+about two seconds sends the same request as a tap, with a vibration and screen flash to confirm it
+went through. If five or more *distinct seats* shake within a 12-second window
+(`SHAKE_WINDOW_S`/`SHAKE_SEATS` in [hub/state.py](hub/state.py)), the crew tablet treats it as
+**turbulence, not passengers calling** -- a banner offers to send the seatbelt safety briefing
+straight away instead of letting five urgent-looking calls flood the request queue at once.
 
 ### Check-in (the airport stage)
 
@@ -271,6 +405,13 @@ passengers who cannot hear the PA. An announcement that is not in the library is
 the crew are told so: Auralink never machine-translates. Typed text works too (`POST /api/pa/match`
 with `{"text": ...}`, then `POST /api/pa/send` with `{"id": "descent", "n": "20"}`).
 
+While the crew are still recording, a caption preview takes shape live underneath the mic button
+("Hearing: ... → Starting descent"), re-matching a growing snapshot of the same audio every second
+or so on the quick passenger model (`POST /api/pa/match` with `{"fast": true}`). This is only a
+preview, shown on the tablet, and is never what gets sent: the crew's own **Stop** always re-runs
+the match on the accurate model, and nothing reaches a seat until they tap **Send to all seats**,
+exactly as before.
+
 Announcements use the larger Whisper `small` model (`AURALINK_PA_ASR_MODEL`, about 3–5 s), passenger
 requests the fast `base` one. With `base`, spoken Japanese PAs came back with sound-alike spellings
 (効果 for 降下, 伝統 for 点灯, 10分 for 二十分); `small` fixed the numbers, and those sound-alike spellings are
@@ -287,12 +428,53 @@ because older and deaf passengers often do not ask. **Start round** tells each w
 in their language, which stop they are ("stop 3 of 7"); **Done** at each seat closes its requests.
 Urgent and medical requests never wait for a round. Logic: [hub/rounds.py](hub/rounds.py).
 
+### After landing
+
+`/arrival?seat=34K` -- one tap from the passenger screen's header icon once the seatbelt sign is
+off -- gives every passenger three things in their own language:
+
+- **Deplaning info**: gate, terminal and baggage-belt number, plus any connecting flight and its
+  gate and boarding window (`GET /api/arrival`).
+- **Lost & found**: a short description tied to the seat reaches the crew tablet's **Lost & found**
+  tab live, where crew mark it Found or Returned (`POST /api/lost-item`, crew-only
+  `GET /api/lost-items` and status updates).
+- **Post-flight feedback**: an inconvenience / suggestion / compliment category, an optional
+  1–5 star rating and a free-text message -- never tied to a name (`POST /api/feedback`).
+
+Both lost items and feedback show up on the crew tablet the moment they are sent (no refresh needed)
+and are rolled into the flight report's totals. State is cleared on a cabin reset and survives a hub
+restart, the same as every other request. Logic: `LostItem`/`Feedback` in
+[hub/state.py](hub/state.py); screen in
+[web/app/arrival/page.jsx](web/app/arrival/page.jsx).
+
 ### Crash recovery
 
 The hub saves the cabin state after every change (`data/flight/cabin_state.json`, git-ignored,
 written atomically) and restores it on start: requests, briefing answers, exit-row checks and the
 flight report survive a restart, and screens reconnect by themselves. The presenter console shows
 when state was restored. Start clean with `AURALINK_FRESH=1 scripts/run.sh` or use Reset cabin.
+
+### Fails safe: no hub, no network
+
+Crash recovery above covers the hub coming back; this is for while it is down. Phones retry the
+hub's socket every second (`web/lib/hub.js`), so a one-off drop never shows anything -- but once a
+passenger's phone has failed to reconnect for about six seconds straight, it switches its own
+screen into a no-server fallback: the type/speak bar (which needs the hub) is replaced by a plain
+"No connection -- show this screen to a flight attendant" banner in the passenger's own language,
+and the picture grid underneath keeps working exactly as before, since it was always rendered from
+what had already loaded (local icons, strings already in memory) rather than fetched live. A tap
+still queues over the socket and is delivered the moment it reconnects; the banner exists
+for the case where it never does in time, so the passenger has something to hold up to a crew
+member walking past. It clears itself the instant the phone reconnects.
+
+The crew tablet gets the mirror image: the same six-second rule shows a "Hub connection lost"
+banner telling crew to fall back to paper and walk the cabin, and the **Passenger needs** panel
+has a **Print offline backup** button at any time (not just during an outage) that prints a plain
+seat / language / accessibility table from whatever the tablet last knew -- crew who print it once
+before departure always have a paper copy, even if the hub dies for the rest of the flight. Logic:
+`OFFLINE_AFTER_MS`/`HUB_DOWN_AFTER_MS` in [web/app/passenger/page.jsx](web/app/passenger/page.jsx)
+and [web/app/crew/page.jsx](web/app/crew/page.jsx); the print view is `OfflineRoster`, styled by
+the `@media print` rule in [web/app/crew/crew.css](web/app/crew/crew.css).
 
 ### Crew PIN
 
